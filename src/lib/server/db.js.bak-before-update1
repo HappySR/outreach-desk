@@ -1,0 +1,187 @@
+import Database from 'better-sqlite3';
+import fs from 'node:fs';
+import path from 'node:path';
+import { env } from '$env/dynamic/private';
+import { DEFAULT_SETTINGS } from '$lib/shared/catalog.js';
+import { istDate } from '$lib/shared/dates.js';
+
+const dbPath = env.DB_PATH || 'data/outreach.db';
+
+function open() {
+  fs.mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true });
+  const db = new Database(dbPath);
+  db.pragma('journal_mode = WAL');
+  db.pragma('foreign_keys = ON');
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS leads (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      place_id TEXT UNIQUE,
+      name TEXT NOT NULL,
+      category TEXT NOT NULL DEFAULT 'services',
+      service TEXT,
+      city TEXT DEFAULT '',
+      address TEXT DEFAULT '',
+      phone TEXT DEFAULT '',
+      email TEXT DEFAULT '',
+      website TEXT DEFAULT '',
+      website_checked INTEGER DEFAULT 0,
+      rating REAL,
+      reviews INTEGER DEFAULT 0,
+      maps_url TEXT DEFAULT '',
+      notes TEXT DEFAULT '',
+      status TEXT DEFAULT 'pending',
+      stage TEXT,
+      channel TEXT DEFAULT 'wa',
+      msg TEXT,
+      next_msg TEXT,
+      price INTEGER,
+      monthly INTEGER,
+      next_follow_at TEXT,
+      dnc INTEGER DEFAULT 0,
+      source TEXT DEFAULT '',
+      added_at TEXT,
+      approved_at TEXT,
+      sends TEXT DEFAULT '{}',
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS leads_status ON leads(status);
+    CREATE INDEX IF NOT EXISTS leads_phone ON leads(phone);
+    CREATE TABLE IF NOT EXISTS messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+      who TEXT NOT NULL,
+      text TEXT NOT NULL,
+      at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      at TEXT DEFAULT (datetime('now')),
+      trigger TEXT, cities TEXT, types TEXT,
+      found INTEGER DEFAULT 0, added INTEGER DEFAULT 0,
+      detail TEXT, error TEXT
+    );
+  `);
+  return db;
+}
+
+/** @type {import('better-sqlite3').Database} */
+export const db = (globalThis.__outreachDb ??= open());
+
+const EDITABLE = new Set([
+  'name', 'category', 'service', 'city', 'phone', 'email', 'website', 'notes', 'channel',
+  'msg', 'next_msg', 'price', 'monthly', 'status', 'stage', 'next_follow_at', 'dnc',
+  'approved_at', 'sends', 'rating', 'reviews'
+]);
+
+function hydrate(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    sends: JSON.parse(row.sends || '{}'),
+    dnc: !!row.dnc,
+    website_checked: !!row.website_checked
+  };
+}
+
+export const getLead = (id) => hydrate(db.prepare('SELECT * FROM leads WHERE id = ?').get(id));
+export const listLeads = (where = '1=1', params = []) =>
+  db.prepare(`SELECT * FROM leads WHERE ${where} ORDER BY id DESC`).all(...params).map(hydrate);
+
+export function updateLead(id, patch) {
+  const keys = Object.keys(patch).filter((k) => EDITABLE.has(k));
+  if (!keys.length) return getLead(id);
+  const sets = keys.map((k) => `${k} = @${k}`).join(', ');
+  const values = Object.fromEntries(
+    keys.map((k) => {
+      let v = patch[k];
+      if (k === 'sends') v = JSON.stringify(v ?? {});
+      if (k === 'dnc') v = v ? 1 : 0;
+      if (v === undefined) v = null;
+      return [k, v];
+    })
+  );
+  db.prepare(`UPDATE leads SET ${sets} WHERE id = @id`).run({ ...values, id });
+  return getLead(id);
+}
+
+export function leadExists(placeId, phone) {
+  if (placeId && db.prepare('SELECT 1 FROM leads WHERE place_id = ?').get(placeId)) return true;
+  if (phone && db.prepare('SELECT 1 FROM leads WHERE phone = ?').get(phone)) return true;
+  return false;
+}
+
+const INSERT_COLS = [
+  'place_id', 'name', 'category', 'service', 'city', 'address', 'phone', 'email', 'website',
+  'website_checked', 'rating', 'reviews', 'maps_url', 'notes', 'source', 'added_at'
+];
+
+/** @returns {number|null} new id, or null if it was a duplicate */
+export function insertLead(l) {
+  const row = Object.fromEntries(INSERT_COLS.map((k) => [k, l[k] ?? (k === 'website_checked' ? 0 : null)]));
+  row.website_checked = row.website_checked ? 1 : 0;
+  row.added_at = row.added_at || istDate();
+  const info = db
+    .prepare(`INSERT OR IGNORE INTO leads (${INSERT_COLS.join(',')}) VALUES (${INSERT_COLS.map((k) => '@' + k).join(',')})`)
+    .run(row);
+  return info.changes ? Number(info.lastInsertRowid) : null;
+}
+
+export function addMessage(leadId, who, text) {
+  db.prepare('INSERT INTO messages (lead_id, who, text) VALUES (?, ?, ?)').run(leadId, who, text);
+}
+export const getMessages = (leadId) =>
+  db.prepare('SELECT * FROM messages WHERE lead_id = ? ORDER BY id ASC').all(leadId);
+export const getMessagesFor = (ids) => {
+  if (!ids.length) return {};
+  const rows = db.prepare(`SELECT * FROM messages WHERE lead_id IN (${ids.map(() => '?').join(',')}) ORDER BY id ASC`).all(...ids);
+  const out = {};
+  for (const r of rows) (out[r.lead_id] ??= []).push(r);
+  return out;
+};
+
+/* settings ---------------------------------------------------------- */
+export function getSettings() {
+  const rows = db.prepare('SELECT key, value FROM settings').all();
+  const stored = Object.fromEntries(rows.map((r) => [r.key, JSON.parse(r.value)]));
+  return { ...DEFAULT_SETTINGS, ...stored };
+}
+export function saveSettings(patch) {
+  const stmt = db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value');
+  const tx = db.transaction((entries) => entries.forEach(([k, v]) => stmt.run(k, JSON.stringify(v))));
+  const allowed = Object.keys(DEFAULT_SETTINGS);
+  tx(Object.entries(patch).filter(([k]) => allowed.includes(k)));
+  return getSettings();
+}
+export const getMeta = (key) => {
+  const r = db.prepare('SELECT value FROM settings WHERE key = ?').get('_' + key);
+  return r ? JSON.parse(r.value) : null;
+};
+export const setMeta = (key, value) =>
+  db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run('_' + key, JSON.stringify(value));
+
+/* runs -------------------------------------------------------------- */
+export function logRun(r) {
+  db.prepare('INSERT INTO runs (trigger, cities, types, found, added, detail, error) VALUES (?,?,?,?,?,?,?)').run(
+    r.trigger, r.cities, r.types, r.found ?? 0, r.added ?? 0, r.detail ? JSON.stringify(r.detail) : null, r.error ?? null
+  );
+}
+export const lastRuns = (n = 8) =>
+  db.prepare('SELECT * FROM runs ORDER BY id DESC LIMIT ?').all(n).map((r) => ({ ...r, detail: r.detail ? JSON.parse(r.detail) : null }));
+
+/* stats ------------------------------------------------------------- */
+export function stats() {
+  const today = istDate();
+  const doneToday = db.prepare("SELECT COUNT(*) c FROM leads WHERE status = 'approved' AND approved_at = ?").get(today).c;
+  const pending = db.prepare("SELECT COUNT(*) c FROM leads WHERE status = 'pending'").get().c;
+  const due = db
+    .prepare("SELECT COUNT(*) c FROM leads WHERE status = 'approved' AND dnc = 0 AND next_follow_at IS NOT NULL AND next_follow_at <= ? AND stage NOT IN ('paid','lost')")
+    .get(today).c;
+  const newToday = db.prepare('SELECT COUNT(*) c FROM leads WHERE added_at = ?').get(today).c;
+  return { today, doneToday, pending, due, newToday };
+}
+
+/* Google Places usage (requests per month) --------------------------- */
+const usageKey = () => 'places-' + istDate().slice(0, 7);
+export const getPlacesUsage = () => getMeta(usageKey()) ?? 0;
+export const bumpPlacesUsage = () => setMeta(usageKey(), getPlacesUsage() + 1);

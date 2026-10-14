@@ -1,0 +1,170 @@
+// End-to-end check. Run `npm run build` first, then `npm test`.
+// Starts a fake Google Places server and the built app, then exercises the main flows.
+import http from 'node:http';
+import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+import Database from 'better-sqlite3';
+
+const PLACES_PORT = 4310, APP_PORT = 4311, BASE = `http://localhost:${APP_PORT}`;
+const DB = '/tmp/outreach-test.db';
+for (const f of [DB, DB + '-wal', DB + '-shm']) fs.rmSync(f, { force: true });
+
+const p = (id, name, phone, rating, count, website, status = 'OPERATIONAL') => ({
+  id, displayName: { text: name }, formattedAddress: 'Guwahati, Assam', nationalPhoneNumber: phone,
+  rating, userRatingCount: count, websiteUri: website, googleMapsUri: 'https://maps.example/' + id, businessStatus: status
+});
+const DATA = {
+  restaurants: [
+    [p('r1', 'Spice Garden Cafe', '098640 11111', 4.4, 120), p('r2', "Domino's Pizza", '098640 22222', 4.0, 900),
+     p('r3', 'No Phone Kitchen', '', 4.5, 80), p('r4', 'Old Closed Diner', '098640 33333', 4.2, 50, undefined, 'CLOSED_PERMANENTLY')],
+    [p('r5', 'Tea Leaf Cafe', '+91 98640 44444', 4.6, 210, 'https://tealeaf.example'), p('r6', 'Mega Mall Food Court', '098640 55555', 4.1, 2000)]
+  ],
+  dental: [[p('d1', 'Bright Dental Clinic', '098640 66666', 4.9, 300), p('d2', 'Landline Dental', '0361 2345678', 4.5, 60),
+            p('d3', 'Insta Only Clinic', '098640 77777', 4.7, 90, 'https://instagram.com/instaonly')]]
+};
+const queries = [];
+const places = http.createServer((req, res) => {
+  let body = '';
+  req.on('data', (c) => (body += c));
+  req.on('end', () => {
+    assert.equal(req.headers['x-goog-api-key'], 'test-key');
+    assert.match(req.headers['x-goog-fieldmask'], /websiteUri/);
+    const q = JSON.parse(body);
+    queries.push(q.textQuery);
+    let set = /restaurant/.test(q.textQuery) ? DATA.restaurants : /dental/.test(q.textQuery) ? DATA.dental : [[]];
+    if (/^best /.test(q.textQuery) && /restaurant/.test(q.textQuery)) set = [[...set[0], p('r7', 'Best Variant Cafe', '098640 88888', 4.5, 70)], set[1]];
+    const page = q.pageToken ? Number(q.pageToken) : 0;
+    res.setHeader('content-type', 'application/json');
+    setTimeout(() => res.end(JSON.stringify({ places: set[page] || [], ...(set[page + 1] ? { nextPageToken: String(page + 1) } : {}) })), 120);
+  });
+}).listen(PLACES_PORT);
+
+const app = spawn('node', ['build'], {
+  env: { ...process.env, PORT: APP_PORT, ORIGIN: BASE, DB_PATH: DB, GOOGLE_PLACES_API_KEY: 'test-key',
+    PLACES_API_BASE: `http://localhost:${PLACES_PORT}`, APP_PASSWORD: 'secret-pw', SESSION_SECRET: 's', CRON_SECRET: 'cron-secret' },
+  stdio: ['ignore', 'pipe', 'pipe']
+});
+app.stderr.on('data', (d) => process.stderr.write(d));
+
+let cookie = '';
+const req = (path, opts = {}) => fetch(BASE + path, { redirect: 'manual', ...opts, headers: { cookie, origin: BASE, ...(opts.headers || {}) } });
+const api = (path, body) => req(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+let passed = 0;
+const ok = (name) => { passed++; console.log('  ✓', name); };
+
+async function waitUp() {
+  for (let i = 0; i < 50; i++) { try { await fetch(BASE + '/login'); return; } catch { await new Promise((r) => setTimeout(r, 200)); } }
+  throw new Error('app did not start');
+}
+
+try {
+  await waitUp();
+
+  let r = await req('/');
+  assert.equal(r.status, 303); assert.match(r.headers.get('location'), /login/);
+  ok('anonymous visitors are sent to /login');
+
+  r = await api('/api/discover', {});
+  assert.equal(r.status, 401); ok('API refuses requests without a session');
+
+  r = await req('/login', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'text/html' }, body: 'password=wrong' });
+  assert.notEqual(r.status, 303); ok('wrong password is rejected');
+
+  r = await req('/login', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'text/html' }, body: 'password=secret-pw' });
+  assert.equal(r.status, 303);
+  cookie = r.headers.get('set-cookie').split(';')[0];
+  ok('correct password signs you in');
+
+  await api('/api/settings', { cities: 'Guwahati', types: ['restaurant', 'clinic'], perRun: 20 });
+  r = await api('/api/discover', { limit: 3 });
+  let j = await r.json();
+  assert.equal(r.status, 200, JSON.stringify(j));
+  assert.equal(j.added, 3); ok('the "limit" option controls how many leads are added');
+  assert.equal(j.skipped.chain, 1); assert.equal(j.skipped.noPhone, 1); assert.equal(j.skipped.closed, 1); assert.equal(j.skipped.tooBig, 1);
+  ok('chain, closed, no-phone and oversized listings are filtered out');
+  assert.ok(queries.some((q) => q.includes('restaurants and cafes in Guwahati')));
+  assert.equal(queries.filter((q) => /restaurant/.test(q)).length, 2); ok('pagination follows nextPageToken');
+  assert.ok(!queries.some((q) => /^best /.test(q))); ok('extra query wordings are not used when the first one is enough');
+
+  // "Find more leads": asks for more than is left, so the other wordings kick in
+  r = await api('/api/discover', { limit: 20 });
+  const more = await r.json();
+  assert.equal(r.status, 200);
+  assert.equal(more.added, 3, JSON.stringify(more));
+  const allNames = new Set([...j.leads, ...more.leads].map((l) => l.name));
+  for (const n of ['Spice Garden Cafe', 'Tea Leaf Cafe', 'Bright Dental Clinic', 'Landline Dental', 'Insta Only Clinic', 'Best Variant Cafe']) assert.ok(allNames.has(n), 'missing ' + n);
+  assert.ok(queries.some((q) => /^best /.test(q)));
+  ok('"Find more leads" digs deeper with other wordings and adds only new businesses');
+
+  // two searches at once: the second is refused
+  const [a1, a2] = await Promise.all([api('/api/discover', {}), api('/api/discover', {})]);
+  const codes = [a1.status, a2.status].sort();
+  assert.deepEqual(codes, [200, 400]);
+  const done = await (a1.status === 200 ? a1 : a2).json();
+  assert.equal(done.added, 0); assert.ok(done.message); assert.equal(done.skipped.existing, 6); assert.ok(done.usage > 0);
+  ok('a second search at the same time is refused, and repeat searches add no duplicates');
+
+  r = await req('/');
+  let html = await r.text();
+  assert.equal(r.status, 200);
+  for (const n of ['Find more leads', 'QR menu', 'Booking website']) assert.ok(html.includes(n), 'queue should show ' + n);
+  ok('queue page renders leads grouped by service');
+
+  for (const path of ['/conversations', '/discover', '/demos', '/pricing', '/setup']) {
+    r = await req(path); assert.equal(r.status, 200, path);
+  }
+  ok('all pages render');
+
+  // pick the Spice Garden lead
+  const id = new Database(DB, { readonly: true }).prepare("SELECT id FROM leads WHERE place_id = 'r1'").get().id;
+
+  r = await api(`/api/leads/${id}`, { action: 'save', price: 5999 });
+  j = await r.json(); assert.equal(j.lead.price, 5999); ok('price override saves');
+
+  r = await api(`/api/leads/${id}`, { action: 'approve', msg: 'Hello test' });
+  j = await r.json(); assert.equal(j.lead.status, 'approved'); assert.equal(j.lead.stage, 'sent'); assert.ok(j.lead.next_follow_at);
+  ok('approve moves the lead into Conversations and schedules a follow-up');
+
+  r = await api(`/api/leads/${id}`, { action: 'approve', msg: 'again' });
+  assert.equal(r.status, 400); ok('a lead cannot be approved twice');
+
+  r = await api(`/api/leads/${id}`, { action: 'reply', text: 'Yes please, send details' });
+  j = await r.json(); assert.equal(j.lead.stage, 'replied'); ok('logging a reply moves the stage to Replied');
+
+  r = await api(`/api/leads/${id}`, { action: 'send', text: 'Send your logo and menu' });
+  j = await r.json(); assert.equal(j.lead.sends.replied, 1); ok('sending a follow-up is logged');
+
+  r = await api(`/api/leads/${id}`, { action: 'stage', stage: 'delivered' });
+  j = await r.json(); assert.equal(j.lead.stage, 'delivered'); ok('stage can be changed');
+
+  r = await req('/conversations'); html = await r.text();
+  assert.ok(html.includes('Spice Garden Cafe') && html.includes('Yes please, send details'));
+  ok('conversation history shows on the Conversations page');
+
+  r = await api(`/api/leads/${id}`, { action: 'dnc' });
+  j = await r.json(); assert.equal(j.lead.dnc, true); assert.equal(j.lead.stage, 'lost'); ok('do-not-contact closes the lead');
+
+  // landline lead cannot be approved on WhatsApp
+  const landlineId = new Database(DB, { readonly: true }).prepare("SELECT id FROM leads WHERE place_id = 'd2'").get().id;
+  r = await api(`/api/leads/${landlineId}`, { action: 'approve', msg: 'hi' });
+  assert.equal(r.status, 400); ok('landline numbers cannot be approved for WhatsApp');
+
+  r = await api('/api/import', { text: 'Test Shop, retail, Jorhat, 9876543210, , , 4.2, 40, Instagram only' });
+  j = await r.json(); assert.equal(j.added, 1);
+  r = await api('/api/import', { text: 'Test Shop, retail, Jorhat, 9876543210' });
+  j = await r.json(); assert.equal(j.duplicates, 1); ok('CSV import works and skips duplicates');
+
+  r = await fetch(BASE + '/api/cron/discover');
+  assert.equal(r.status, 401);
+  r = await fetch(BASE + '/api/cron/discover', { headers: { authorization: 'Bearer cron-secret' } });
+  assert.equal(r.status, 200); ok('cron endpoint needs the secret and works with it');
+
+  console.log(`\n${passed} checks passed`);
+} catch (e) {
+  console.error('\nFAILED:', e.message);
+  process.exitCode = 1;
+} finally {
+  app.kill();
+  places.close();
+}

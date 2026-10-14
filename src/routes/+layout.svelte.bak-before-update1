@@ -1,0 +1,57 @@
+<script>
+  import '../app.css';
+  import { page } from '$app/state';
+
+  let { data, children } = $props();
+
+  const links = [
+    ['/', "Today's queue"],
+    ['/conversations', 'Conversations'],
+    ['/discover', 'Discover'],
+    ['/demos', 'Demo sites'],
+    ['/pricing', 'Pricing & settings'],
+    ['/setup', 'Setup checklist']
+  ];
+  const isActive = (href) => (href === '/' ? page.url.pathname === '/' : page.url.pathname.startsWith(href));
+  const pct = $derived(Math.min(100, (data.stats.doneToday / (data.cap || 20)) * 100));
+</script>
+
+{#if page.url.pathname !== '/login'}
+  <div class="wrap">
+    <header class="top">
+      <div>
+        <h1>Outreach Desk</h1>
+        <p class="sub">
+          New leads are found for you, ranked, and drafted. You approve, track replies and follow up here.
+        </p>
+      </div>
+      <div class="meter">
+        <b>{data.stats.doneToday}</b> / {data.cap} new messages approved today
+        <div class="bar"><i style="width:{pct}%"></i></div>
+      </div>
+    </header>
+
+    {#if !data.hasKey}
+      <p class="warn" style="margin:0 0 10px">
+        GOOGLE_PLACES_API_KEY is not set, so automatic lead search is off. Add it to your .env file and restart.
+      </p>
+    {/if}
+
+    <nav class="tabs" aria-label="Main">
+      {#each links as [href, label]}
+        <a {href} aria-current={isActive(href) ? 'page' : undefined}>
+          {label}{#if href === '/conversations' && data.stats.due} ({data.stats.due} due){/if}
+        </a>
+      {/each}
+      {#if data.authOn}
+        <form method="POST" action="/logout" style="margin-left:auto">
+          <button class="btn ghost small" type="submit">Sign out</button>
+        </form>
+      {/if}
+    </nav>
+
+    {@render children()}
+  </div>
+{:else}
+  {@render children()}
+{/if}
